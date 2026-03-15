@@ -1,0 +1,58 @@
+[
+  {
+    "name": "Zabrze",
+    "code": "PWR3847PL",
+    "power": "35 MW",
+    "is_active": true,
+    "latitude": 50.3249,
+    "longitude": 18.7857
+  },
+  {
+    "name": "Piotrków Trybunalski",
+    "code": "PWR5921PL",
+    "power": "28 MW",
+    "is_active": true,
+    "latitude": 51.4054,
+    "longitude": 19.7032
+  },
+  {
+    "name": "Grudziądz",
+    "code": "PWR7264PL",
+    "power": "1138 MW",
+    "is_active": true,
+    "latitude": 53.4874,
+    "longitude": 18.7544
+  },
+  {
+    "name": "Tczew",
+    "code": "PWR1593PL",
+    "power": "31 MW",
+    "is_active": true,
+    "latitude": 54.0924,
+    "longitude": 18.7774
+  },
+  {
+    "name": "Radom",
+    "code": "PWR8406PL",
+    "power": "38 MW",
+    "is_active": true,
+    "latitude": 51.4025,
+    "longitude": 21.1471
+  },
+  {
+    "name": "Chelmno",
+    "code": "PWR2758PL",
+    "power": "128 MW",
+    "is_active": true,
+    "latitude": 53.3486,
+    "longitude": 18.4251
+  },
+  {
+    "name": "Żarnowiec",
+    "code": "PWR6132PL",
+    "power": "0 MW",
+    "is_active": false,
+    "latitude": 54.75,
+    "longitude": 18.0833
+  }
+]

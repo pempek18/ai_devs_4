@@ -1,0 +1,26 @@
+[
+  {
+    "name": "Cezary",
+    "surname": "Żurek",
+    "born": 1987,
+    "tags": ["transport"]
+  },
+  {
+    "name": "Jacek",
+    "surname": "Nowak",
+    "born": 1991,
+    "tags": ["transport"]
+  },
+  {
+    "name": "Wojciech",
+    "surname": "Bielik",
+    "born": 1986,
+    "tags": ["transport"]
+  },
+  {
+    "name": "Wacław",
+    "surname": "Jasiński",
+    "born": 1986,
+    "tags": ["transport", "IT"]
+  }
+]
