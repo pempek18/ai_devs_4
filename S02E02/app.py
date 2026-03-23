@@ -8,6 +8,9 @@ Uruchomienie:
   python app.py --legacy --heuristic
   python app.py --reset
 
+Snapshoty planszy (electric_*.png) trafiaja do katalogu img/; na starcie run_agent i trybu --legacy
+wywolywane jest init_electric_images_folder() — usuwa electric*.png z img/ i tworzy folder.
+
 Agent: model tekstowy widzi wyniki narzedzi. Wizja zwraca JSON z polem cells (3x3 obiekty na komorke:
 id, n,e,s,w, brief) — to samo trafia do narzedzi i agenta.
 
@@ -44,6 +47,7 @@ from openai import OpenAI
 from PIL import Image
 
 BASE_DIR = Path(__file__).resolve().parent
+IMG_DIR = BASE_DIR / "img"
 load_dotenv(BASE_DIR / ".env")
 load_dotenv(BASE_DIR.parent / ".env")
 
@@ -211,7 +215,8 @@ def print_vision_dual_and_summary(
 VISION_SYSTEM = (
     "You read ONE 3x3 electrical pipe puzzle image split into 9 equal cells (rows 1..3 top to bottom, "
     "columns 1..3 left to right). For EACH cell separately, decide which sides have a wire to that edge "
-    "(N,E,S,W = 0/1). Output ONLY a single JSON object with key grid — no global essay, no markdown. "
+    "(N,E,S,W = 0/1). Each cell has at most 3 directions: n+e+s+w must be 0, 1, 2, or 3 — never 4. "
+    "Output ONLY a single JSON object with key grid — no global essay, no markdown. "
     "Do not describe the whole image, background color, or that it is a 3x3 grid — only per-cell facts."
 )
 
@@ -220,10 +225,11 @@ VISION_USER = """Return exactly one JSON object with a single key grid (3x3 arra
 Each grid[r][c] MUST have:
 - id: string AxB for that cell (grid[0][0] is 1x1, grid[2][2] is 3x3).
 - n, e, s, w: integers 0 or 1 (wire to that edge of this cell).
-- brief: one English sentence, max ~200 chars, ONLY about this cell: which edges have wires and shape (L/T/cross/straight).
+- brief: one English sentence, max ~200 chars, ONLY about this cell: which edges have wires and shape (L-corner, T-junction, straight, single stub, or none).
   Do not write generic filler: no The image, no 3x3 grid, no beige background, no overall puzzle description.
 
 Rules for n,e,s,w: 1 only if a brown/tan wire reaches the middle of that edge. Ignore PWR labels and decorations.
+  Per cell: at most three of n,e,s,w may be 1 (sum 0–3); never all four 1.
 
 Output valid JSON only; escape double-quotes inside string values; no raw line breaks inside strings.
 
@@ -884,13 +890,29 @@ def download(url: str, dest: Path) -> None:
     dest.write_bytes(r.content)
 
 
+def init_electric_images_folder() -> int:
+    """
+    Przygotowuje katalog img/: tworzy go, usuwa wszystkie pliki electric*.png.
+    Zwraca liczbe usunietych plikow.
+    """
+    IMG_DIR.mkdir(parents=True, exist_ok=True)
+    removed = 0
+    for p in sorted(IMG_DIR.glob("electric*.png")):
+        try:
+            p.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def electric_snap_path_factory() -> Callable[[], Path]:
-    """Kolejne pliki electric_1.png, electric_2.png przy kazdym pobraniu planszy z huba."""
+    """Kolejne pliki img/electric_1.png, img/electric_2.png przy kazdym pobraniu planszy z huba."""
     n = [0]
 
     def next_path() -> Path:
         n[0] += 1
-        return BASE_DIR / f"electric_{n[0]}.png"
+        return IMG_DIR / f"electric_{n[0]}.png"
 
     return next_path
 
@@ -942,7 +964,7 @@ AGENT_TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "get_current_board",
             "description": (
-                "Pobiera swiezy PNG planszy z huba; zapisuje jako electric_1.png, electric_2.png, ...; zwraca cells (jak wyzej) oraz comparison wzgledem celu."
+                "Pobiera swiezy PNG planszy z huba; zapisuje jako img/electric_1.png, img/electric_2.png, ...; zwraca cells (jak wyzej) oraz comparison wzgledem celu."
             ),
             "parameters": {"type": "object", "properties": {}},
         },
@@ -964,14 +986,14 @@ AGENT_TOOLS: list[dict[str, Any]] = [
             },
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "reset_board",
-            "description": "Resetuje plansze (GET electricity.png?reset=1). Opcjonalnie gdy stan jest zly.",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
+    # {
+    #     "type": "function",
+    #     "function": {
+    #         "name": "reset_board",
+    #         "description": "Resetuje plansze (GET electricity.png?reset=1). Opcjonalnie gdy stan jest zly.",
+    #         "parameters": {"type": "object", "properties": {}},
+    #     },
+    # },
 ]
 
 
@@ -993,6 +1015,8 @@ def run_agent(
     if not OPENAI_API_KEY:
         print("Agent wymaga OPENAI_API_KEY (model tekstowy + function calling).", file=sys.stderr)
         return 1
+
+    init_electric_images_folder()
 
     solved_path = BASE_DIR / "solved_electricity.png"
     key = HUB_API_KEY
@@ -1224,6 +1248,8 @@ def main() -> int:
             file=sys.stderr,
         )
         use_vision = False
+
+    init_electric_images_folder()
 
     solved_path = BASE_DIR / "solved_electricity.png"
     key = HUB_API_KEY
