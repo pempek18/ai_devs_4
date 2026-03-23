@@ -51,41 +51,9 @@ python app.py
 
 Główny serwer będzie dostępny na porcie 3000 (domyślnie).
 
-### Krok 3: Udostępnij serwer publicznie
+### Krok 3: Udostępnij serwer publicznie przez Azyl
 
-Serwer musi być dostępny publicznie, aby Hub mógł się do niego połączyć. Możesz użyć:
-
-#### Opcja A: ngrok (najprostsze)
-
-1. Zainstaluj ngrok: https://ngrok.com/download
-   ```powershell
-   # Windows
-   winget install ngrok
-   ```
-
-2. Uruchom tunel:
-   ```bash
-   ngrok http 3000
-   ```
-
-3. Skopiuj URL (np. `https://abc123.ngrok-free.app`)
-
-4. Zgłoś do Hub:
-   ```bash
-   python submit_to_hub.py https://abc123.ngrok-free.app/
-   ```
-
-#### Opcja B: Azyl (SSH tunnel)
-
-```bash
-ssh -R 51364:localhost:3000 agent11364@azyl.ag3nts.org -p 5022
-```
-
-Następnie użyj URL: `https://azyl-51364.ag3nts.org/`
-
-#### Opcja C: pinggy lub inny tunel
-
-Użyj dowolnego tunelu HTTP który przekierowuje na `localhost:3000`
+Serwer musi być dostępny publicznie, aby Hub mógł się do niego połączyć. Użyj Azyl lub innego tunelu (ngrok, pinggy).
 
 ## Endpointy
 

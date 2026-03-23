@@ -1,2 +1,5 @@
 secrets.json
 .env
+*.png
+*zalacznik*
+*.csv
