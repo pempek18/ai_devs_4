@@ -11,12 +11,13 @@ Uruchomienie:
 Snapshoty planszy (electric_*.png) trafiaja do katalogu img/; na starcie run_agent i trybu --legacy
 wywolywane jest init_electric_images_folder() — usuwa electric*.png z img/ i tworzy folder.
 
-Agent: model tekstowy widzi wyniki narzedzi. Wizja zwraca JSON z polem cells (3x3 obiekty na komorke:
-id, n,e,s,w, brief) — to samo trafia do narzedzi i agenta.
+Agent: model tekstowy widzi wyniki narzedzi. Wizja zwraca JSON (pole grid 3x3) — ten sam obiekt w polu
+"vision" w odpowiedzi narzedzi; get_current_board dodaje comparison (obroty wzgledem celu).
 
 .env: HUB_API_KEY (wymagane). Wizja: GEMINI_API_KEY (Google AI) i/lub OPENAI_API_KEY.
 ELECTRICITY_VISION_PROVIDER=auto|gemini|openai — ktory backend wizji (auto: Gemini jesli jest GEMINI_API_KEY).
-ELECTRICITY_GEMINI_MODEL — np. gemini-2.0-flash (bezposrednio API Google).
+ELECTRICITY_GEMINI_MODEL — ID modelu dla generativelanguage.googleapis.com, np. gemini-2.0-flash lub gemini-1.5-flash.
+  Prefiks google/ (jak w OpenRouter) jest automatycznie obcinany.
 ELECTRICITY_OPENAI_VISION_MODEL — np. gpt-4o-mini (bezposrednio api.openai.com).
 ELECTRICITY_VISION_JSON_MODE=1 — JSON mode (OpenAI: response_format; Gemini: responseMimeType).
 ELECTRICITY_VISION_MAX_OUTPUT — max tokenow WYJSCIA Gemini (domyslnie 2048; JSON 3x3 nie potrzebuje 8k).
@@ -26,6 +27,8 @@ GEMINI_VISION_JPEG_QUALITY — 1-95, domyslnie 85 (tylko gdy obraz jest kodowany
 ELECTRICITY_OPENAI_VISION_MAX_TOKENS — limit wyjscia OpenAI wizji (domyslnie 2048).
 ELECTRICITY_AGENT_MODEL — model agenta (tylko OpenAI, np. gpt-4o-mini).
 ELECTRICITY_VISION_FALLBACK_OPENAI_ON_429=1 — przy limicie Gemini (429) automatycznie wizja przez OpenAI (jesli jest klucz).
+OPENAI_VISION_MAX_RETRIES — proby przy 429 OpenAI wizji (domyslnie 4); OPENAI_VISION_RETRY_DELAY_SEC — baza sekund miedzy probami (domyslnie 6).
+ELECTRICITY_VISION_FALLBACK_GEMINI_ON_OPENAI_429=1 — gdy OpenAI zwroci 429 po probach, jednorazowo wizja przez Gemini (wymaga GEMINI_API_KEY).
 """
 from __future__ import annotations
 
@@ -58,7 +61,28 @@ VERIFY_URL = "https://hub.ag3nts.org/verify"
 SOLVED_PNG_URL = "https://hub.ag3nts.org/i/solved_electricity.png"
 
 # Bezposrednio Google Generative Language API (nie OpenRouter).
-DEFAULT_GEMINI_VISION_MODEL = os.getenv("ELECTRICITY_GEMINI_MODEL", "gemini-2.0-flash")
+
+
+def _normalize_gemini_model_id_for_google_api(raw: str | None) -> str:
+    """URL to .../models/{id}:generateContent — id to np. gemini-1.5-flash, nie google/gemini-1.5-flash."""
+    s = (raw or "").strip().strip('"').strip("'")
+    # BOM / zero-width
+    s = s.lstrip("\ufeff\u200b")
+    if not s:
+        return "gemini-2.0-flash"
+    for sep in ("\\", "／", "∕"):  # backslash, fullwidth /, division slash
+        s = s.replace(sep, "/")
+    if "/" in s:
+        s = s.rsplit("/", 1)[-1].strip()
+    low = s.lower()
+    if low.startswith("models/"):
+        s = s[7:].lstrip("/")
+    return s
+
+
+DEFAULT_GEMINI_VISION_MODEL = _normalize_gemini_model_id_for_google_api(
+    os.getenv("ELECTRICITY_GEMINI_MODEL", "gemini-2.0-flash")
+)
 DEFAULT_OPENAI_MODEL = os.getenv("ELECTRICITY_OPENAI_VISION_MODEL", "gpt-4o-mini")
 DEFAULT_AGENT_MODEL = os.getenv("ELECTRICITY_AGENT_MODEL", "gpt-4o-mini")
 
@@ -94,13 +118,6 @@ def _active_vision_label() -> str:
     return f"OpenAI/{DEFAULT_OPENAI_MODEL}"
 
 
-def _grid_as_dicts(grid: list[list[tuple[int, int, int, int]]]) -> list[list[dict[str, int]]]:
-    return [
-        [{"n": c[0], "e": c[1], "s": c[2], "w": c[3]} for c in row]
-        for row in grid
-    ]
-
-
 def format_grid_ascii(grid: list[list[tuple[int, int, int, int]]]) -> str:
     lines = []
     for r in range(3):
@@ -115,24 +132,6 @@ def format_grid_ascii(grid: list[list[tuple[int, int, int, int]]]) -> str:
                 or "-"
             )
         lines.append(" | ".join(cells))
-    return "\n".join(lines)
-
-
-def format_grid_with_row_labels(grid: list[list[tuple[int, int, int, int]]]) -> str:
-    """3 wiersze z etykieta rzedu (1| 2| 3|) dla czytelnosci."""
-    lines = []
-    for r in range(3):
-        cells = []
-        for c in range(3):
-            n, e, s, w = grid[r][c]
-            cells.append(
-                ("" if not n else "N")
-                + ("" if not e else "E")
-                + ("" if not s else "S")
-                + ("" if not w else "W")
-                or "-"
-            )
-        lines.append(f"rzad {r + 1}:  " + " | ".join(cells))
     return "\n".join(lines)
 
 
@@ -174,44 +173,6 @@ def compare_grids_for_agent(
     }
 
 
-def print_vision_dual_and_summary(
-    current: list[list[tuple[int, int, int, int]]],
-    target: list[list[tuple[int, int, int, int]]],
-    *,
-    header: str,
-    cmp: dict[str, Any] | None = None,
-) -> None:
-    """Druk: dwie siatki obok siebie + krotka lista roznic (tylko konsola)."""
-    if cmp is None:
-        cmp = compare_grids_for_agent(current, target)
-    left_lines = format_grid_with_row_labels(current).splitlines()
-    right_lines = format_grid_with_row_labels(target).splitlines()
-    w = max(len(x) for x in left_lines) + 1
-    lt = "AKTUALNY (wizja)"
-    rt = "CEL (docelowy, wizja)"
-    print("")
-    print(f"--- {header} ---")
-    print(f"{lt.ljust(w)} | {rt}")
-    print("-" * w + "-+-" + "-" * max(len(rt), 20))
-    for i in range(3):
-        print(f"{left_lines[i].ljust(w)} | {right_lines[i]}")
-    print("")
-    if cmp["match_complete"]:
-        print("Porownanie: WSZYSTKIE KOMORKI ZGODNE Z CELEM (0 obrotow) -> NIE obracaj juz zadnego pola.")
-    else:
-        if cmp["impossible_cells"]:
-            print(
-                "Porownanie: BLAD TYPU KLOCKA (obrot nie wystarczy): "
-                + ", ".join(cmp["impossible_cells"])
-            )
-        if cmp["pending_rotations_summary"]:
-            print(
-                "Do wykonania (tylko te pola, tyle obrotow 90 w prawo): "
-                + ", ".join(cmp["pending_rotations_summary"])
-            )
-    print("")
-
-
 VISION_SYSTEM = (
     "You read ONE 3x3 electrical pipe puzzle image split into 9 equal cells (rows 1..3 top to bottom, "
     "columns 1..3 left to right). For EACH cell separately, decide which sides have a wire to that edge "
@@ -242,155 +203,23 @@ def _png_data_url(path: Path) -> str:
     return f"data:image/png;base64,{b64}"
 
 
-def _repair_llm_json(s: str) -> str:
-    """Typowe uszkodzenia JSON z LLM: przecinek przed }/], cudzyslowy unicode."""
-    s = s.replace("\u201c", '"').replace("\u201d", '"').replace("\u2018", "'").replace("\u2019", "'")
-    s = re.sub(r",\s*([}\]])", r"\1", s)
-    return s
-
-
-def _slice_balanced_json_value(s: str, i: int) -> str | None:
-    """Wycina jeden pelny obiekt JSON { ... } lub tablice [ ... ] od indeksu i (string-aware)."""
-    if i >= len(s) or s[i] not in "{[":
-        return None
-    pairs = {"{": "}", "[": "]"}
-    stack = [pairs[s[i]]]
-    j = i + 1
-    instr = False
-    esc = False
-    while j < len(s):
-        c = s[j]
-        if esc:
-            esc = False
-            j += 1
-            continue
-        if instr:
-            if c == "\\":
-                esc = True
-            elif c == '"':
-                instr = False
-            j += 1
-            continue
-        if c == '"':
-            instr = True
-            j += 1
-            continue
-        if c in "{[":
-            stack.append(pairs[c])
-        elif c in "}]":
-            if not stack or c != stack[-1]:
-                return None
-            stack.pop()
-            if not stack:
-                return s[i : j + 1]
-        j += 1
-    return None
-
-
-def _try_loads_dict(blob: str) -> dict | None:
-    blob = blob.strip()
-    for variant in (blob, _repair_llm_json(blob)):
-        try:
-            out = json.loads(variant)
-            if isinstance(out, dict):
-                return out
-        except json.JSONDecodeError:
-            continue
-    return None
-
-
-def _parse_dicts_from_text(text: str) -> list[dict]:
-    """Probuje wyciac obiekty JSON { ... } i sparsowac (odpornie na smieci wokol)."""
-    out: list[dict] = []
-    dec = json.JSONDecoder()
-    i = 0
-    while i < len(text):
-        if text[i] != "{":
-            i += 1
-            continue
-        sub = _slice_balanced_json_value(text, i)
-        if sub:
-            for cand in (sub, _repair_llm_json(sub)):
-                try:
-                    obj, _ = dec.raw_decode(cand, 0)
-                    if isinstance(obj, dict) and "grid" in obj:
-                        out.append(obj)
-                        break
-                except json.JSONDecodeError:
-                    try:
-                        obj = json.loads(cand)
-                        if isinstance(obj, dict) and "grid" in obj:
-                            out.append(obj)
-                            break
-                    except json.JSONDecodeError:
-                        continue
-        i += 1
-    return out
-
-
-def _fallback_grid_only_object(text: str) -> dict:
-    """Gdy caly JSON jest zepsuty (np. nieescapowane cudzyslowy w brief), wycinamy tylko tablice grid."""
-    m = re.search(r'"grid"\s*:\s*', text)
-    if not m:
-        raise ValueError("Brak pola grid w odpowiedzi modelu")
-    i = m.end()
-    while i < len(text) and text[i] in " \t\n\r":
-        i += 1
-    if i >= len(text) or text[i] != "[":
-        raise ValueError("Brak tablicy po grid w odpowiedzi modelu")
-    arr = _slice_balanced_json_value(text, i)
-    if not arr:
-        raise ValueError("Nie udalo sie wyciac tablicy grid")
-    wrapper = '{"grid":' + arr + "}"
-    for w in (wrapper, _repair_llm_json(wrapper)):
-        try:
-            obj = json.loads(w)
-            if isinstance(obj, dict) and "grid" in obj:
-                return obj
-        except json.JSONDecodeError:
-            continue
-    raise ValueError("Tablica grid nadal nieparsowalna — skroc brief w komorkach lub zmien model.")
-
-
 def _extract_json_object(text: str) -> dict:
-    """Parsuje odpowiedz wizji: caly JSON lub — przy bledzie — samo pole grid."""
+    """Oczekuje czystego JSON z modelem wizji (responseMimeType / json_object) — obiekt z kluczem grid."""
     text = (text or "").strip()
     if not text:
         raise ValueError("Pusta odpowiedz modelu wizji")
-
-    blocks: list[str] = [text]
-    fence = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
-    if fence:
-        blocks.insert(0, fence.group(1).strip())
-
-    for block in blocks:
-        got = _try_loads_dict(block)
-        if got and "grid" in got:
-            return got
-        for d in _parse_dicts_from_text(block):
-            if "grid" in d:
-                return d
-
-    for block in blocks:
-        repaired = _repair_llm_json(block)
-        got = _try_loads_dict(repaired)
-        if got and "grid" in got:
-            return got
-        for d in _parse_dicts_from_text(repaired):
-            if "grid" in d:
-                return d
-
     try:
-        return _fallback_grid_only_object(text)
-    except ValueError:
-        pass
-    try:
-        return _fallback_grid_only_object(_repair_llm_json(text))
-    except ValueError as e:
+        out = json.loads(text)
+    except json.JSONDecodeError as e:
         raise ValueError(
-            "Nie udalo sie sparsowac JSON z modelu wizji. "
-            "Sprobuj innego modelu (ELECTRICITY_VISION_MODEL) lub krotszego opisu w prompcie."
+            "Wizja musi zwrocic wylacznie poprawny JSON (ELECTRICITY_VISION_JSON_MODE=1). "
+            f"json.loads: {e}"
         ) from e
+    if not isinstance(out, dict):
+        raise ValueError(f"Oczekiwano obiektu JSON, jest: {type(out).__name__}")
+    if "grid" not in out and "cells" not in out:
+        raise ValueError("JSON wizji musi miec klucz 'grid' lub 'cells'")
+    return out
 
 
 def _coerce_grid_to_3x3(raw: Any) -> list[list[Any]]:
@@ -481,76 +310,15 @@ def _grid_from_vision_payload(data: dict) -> list[list[tuple[int, int, int, int]
     return out
 
 
-def _infer_tile_shape(n: int, e: int, s: int, w: int) -> str:
-    """Etykieta geometryczna z maski NESW (do JSON dla agenta)."""
-    cnt = n + e + s + w
-    if cnt == 0:
-        return "blank"
-    if cnt == 1:
-        return "end"
-    if cnt == 2:
-        if n and s and not e and not w:
-            return "straight_ns"
-        if e and w and not n and not s:
-            return "straight_ew"
-        return "L"
-    if cnt == 3:
-        return "T"
-    if cnt == 4:
-        return "cross"
-    return "unknown"
-
-
-def _build_normalized_cells(data: dict) -> list[list[dict[str, Any]]]:
-    """Kanoniczna lista komorek dla agenta (to samo co ma wizja w grid)."""
-    g = data.get("grid")
-    if not isinstance(g, list) or len(g) != 3:
-        raise ValueError("Oczekiwano grid 3x3")
-    out: list[list[dict[str, Any]]] = []
-    for r in range(3):
-        row = g[r]
-        if not isinstance(row, list) or len(row) != 3:
-            raise ValueError("Wiersz grid musi miec 3 komorki")
-        rlist: list[dict[str, Any]] = []
-        for c in range(3):
-            addr = f"{r + 1}x{c + 1}"
-            cell = row[c]
-            if not isinstance(cell, dict):
-                raise ValueError("Komorka musi byc obiektem JSON")
-            n, e, s, w = (
-                int(cell["n"]),
-                int(cell["e"]),
-                int(cell["s"]),
-                int(cell["w"]),
-            )
-            brief_raw = cell.get("brief", "")
-            brief = str(brief_raw).strip()[:400] if brief_raw is not None else ""
-            cid = str(cell.get("id", addr)).strip() or addr
-            shape = _infer_tile_shape(n, e, s, w)
-            rlist.append(
-                {
-                    "id": cid,
-                    "n": n,
-                    "e": e,
-                    "s": s,
-                    "w": w,
-                    "shape": shape,
-                    "brief": brief,
-                }
-            )
-        out.append(rlist)
-    return out
-
-
 class VisionBoardParse(NamedTuple):
-    """Wynik wizji: siatka logiczna + te same komorki co w JSON dla agenta."""
+    """Wynik wizji: siatka logiczna (obroty) + ten sam JSON co idzie do agenta (pole vision)."""
 
     grid: list[list[tuple[int, int, int, int]]]
-    cells: list[list[dict[str, Any]]]
+    vision: dict[str, Any]
 
 
 def _parse_vision_full(data: dict) -> VisionBoardParse:
-    """Model wizji (HTTP) juz zwrocil tresc — tu tylko normalizacja ksztaltu grid + komorki."""
+    """Normalizacja ksztaltu grid; vision to obiekt przekazywany do agenta bez dalszej obróbki."""
     merged = dict(data)
     raw = _pick_grid_payload(merged)
     if raw is None:
@@ -560,8 +328,7 @@ def _parse_vision_full(data: dict) -> VisionBoardParse:
         )
     merged["grid"] = _coerce_grid_to_3x3(raw)
     grid = _grid_from_vision_payload(merged)
-    cells = _build_normalized_cells(merged)
-    return VisionBoardParse(grid=grid, cells=cells)
+    return VisionBoardParse(grid=grid, vision=merged)
 
 
 def _gemini_vision_max_edge() -> int | None:
@@ -631,10 +398,16 @@ def compress_image_for_gemini_context(path: Path) -> tuple[bytes, str]:
     return buf.getvalue(), "image/jpeg"
 
 
-def parse_grid_gemini(path: Path, model: str) -> VisionBoardParse:
-    """Google Generative Language API (Gemini) — obraz + tekst, bez OpenRouter."""
+def parse_grid_gemini(
+    path: Path, model: str, *, no_chained_fallback: bool = False
+) -> VisionBoardParse:
+    """Google Generative Language API (Gemini) — obraz + tekst, bez OpenRouter.
+
+    no_chained_fallback: True gdy wejscie juz z fallbacku OpenAI->Gemini — bez ponownego skoku na OpenAI przy 429.
+    """
     if not GEMINI_API_KEY:
         raise RuntimeError("Brak GEMINI_API_KEY w .env")
+    model = _normalize_gemini_model_id_for_google_api(model)
     img_bytes, img_mime = compress_image_for_gemini_context(path)
     b64 = base64.standard_b64encode(img_bytes).decode("ascii")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -687,13 +460,17 @@ def parse_grid_gemini(path: Path, model: str) -> VisionBoardParse:
     assert r is not None
     if r.status_code == 429:
         fb = os.getenv("ELECTRICITY_VISION_FALLBACK_OPENAI_ON_429", "1").strip().lower()
-        if fb in ("1", "true", "yes", "on") and OPENAI_API_KEY:
+        if (
+            not no_chained_fallback
+            and fb in ("1", "true", "yes", "on")
+            and OPENAI_API_KEY
+        ):
             print(
                 "[wizja] Gemini: 429 Too Many Requests — przejscie na OpenAI "
                 f"({DEFAULT_OPENAI_MODEL}). Wylacz: ELECTRICITY_VISION_FALLBACK_OPENAI_ON_429=0",
                 file=sys.stderr,
             )
-            return parse_grid_openai(path, DEFAULT_OPENAI_MODEL)
+            return parse_grid_openai(path, DEFAULT_OPENAI_MODEL, no_chained_fallback=True)
         raise RuntimeError(
             "Gemini API zwrocilo 429 Too Many Requests — przekroczony limit zapytan "
             "(RPM/TPM/dzienny quota albo burst). "
@@ -713,7 +490,10 @@ def parse_grid_gemini(path: Path, model: str) -> VisionBoardParse:
     return _parse_vision_full(data)
 
 
-def parse_grid_openai(path: Path, model: str) -> VisionBoardParse:
+def parse_grid_openai(
+    path: Path, model: str, *, no_chained_fallback: bool = False
+) -> VisionBoardParse:
+    """no_chained_fallback: True gdy wejscie z fallbacku Gemini->OpenAI — bez skoku z powrotem na Gemini przy 429."""
     if not OPENAI_API_KEY:
         raise RuntimeError("Brak OPENAI_API_KEY")
     url = "https://api.openai.com/v1/chat/completions"
@@ -740,7 +520,52 @@ def parse_grid_openai(path: Path, model: str) -> VisionBoardParse:
         ],
     }
     payload.update(_vision_response_format_block_openai())
-    r = requests.post(url, headers=headers, json=payload, timeout=120)
+    max_retries = int(os.getenv("OPENAI_VISION_MAX_RETRIES", "4"))
+    base_delay = float(os.getenv("OPENAI_VISION_RETRY_DELAY_SEC", "6"))
+    r: requests.Response | None = None
+    for attempt in range(max_retries + 1):
+        r = requests.post(url, headers=headers, json=payload, timeout=120)
+        if r.status_code != 429:
+            break
+        if attempt >= max_retries:
+            break
+        ra = r.headers.get("Retry-After")
+        try:
+            sleep_s = float(ra) if ra else base_delay * (attempt + 1)
+        except ValueError:
+            sleep_s = base_delay * (attempt + 1)
+        print(
+            f"[wizja] OpenAI: 429 — czekam {sleep_s:.0f}s, proba {attempt + 2}/{max_retries + 1}",
+            file=sys.stderr,
+        )
+        time.sleep(min(max(sleep_s, 1.0), 120.0))
+
+    assert r is not None
+    if r.status_code == 429:
+        fb = os.getenv("ELECTRICITY_VISION_FALLBACK_GEMINI_ON_OPENAI_429", "0").strip().lower()
+        if (
+            not no_chained_fallback
+            and fb in ("1", "true", "yes", "on")
+            and GEMINI_API_KEY
+        ):
+            print(
+                "[wizja] OpenAI: 429 po probach — przejscie na Gemini "
+                f"({DEFAULT_GEMINI_VISION_MODEL}). Wylacz: ELECTRICITY_VISION_FALLBACK_GEMINI_ON_OPENAI_429=0",
+                file=sys.stderr,
+            )
+            return parse_grid_gemini(path, DEFAULT_GEMINI_VISION_MODEL, no_chained_fallback=True)
+        try:
+            err_body = r.json()
+        except json.JSONDecodeError:
+            err_body = {"raw": r.text[:500]}
+        raise RuntimeError(
+            "OpenAI API: 429 Too Many Requests (limit RPM/TPM lub quota). "
+            "Agent wywoluje wizje wielokrotnie (cel + kazdy odczyt planszy) — na nizszym tierze OpenAI limit jest may. "
+            "Opcje: poczekaj kilka minut; zwieksz OPENAI_VISION_MAX_RETRIES / OPENAI_VISION_RETRY_DELAY_SEC; "
+            "ustaw ELECTRICITY_VISION_PROVIDER=gemini jesli masz GEMINI_API_KEY; "
+            "lub ELECTRICITY_VISION_FALLBACK_GEMINI_ON_OPENAI_429=1. "
+            f"Odpowiedz API: {err_body!r}"
+        )
     r.raise_for_status()
     body = r.json()
     content = body["choices"][0]["message"]["content"]
@@ -764,18 +589,6 @@ def parse_grid_vision(path: Path) -> VisionBoardParse:
     if OPENAI_API_KEY:
         return parse_grid_openai(path, DEFAULT_OPENAI_MODEL)
     raise RuntimeError("Brak GEMINI_API_KEY i OPENAI_API_KEY — uzyj --heuristic lub ustaw klucz.")
-
-
-def log_vision_model_output(title: str, v: VisionBoardParse) -> None:
-    """Logi konsoli: ten sam JSON co dostaje agent (komorka po komorce)."""
-    print(f"\n=== {title} ===")
-    print("[cells — JSON per pole: id, n,e,s,w, shape, brief]")
-    for r in range(3):
-        for c in range(3):
-            cell = v.cells[r][c]
-            line = json.dumps(cell, ensure_ascii=False)
-            print(f"  {line}")
-    print("")
 
 
 def _luminance(rgb: np.ndarray) -> np.ndarray:
@@ -944,7 +757,7 @@ Zasady:
 - Jesli impossible / IMPOSSIBLE_TILE_TYPE: obrot nie pomoze — reset_board lub ponowny odczyt wizji.
 - Jesli rotate_cell zwroci FLG — koncz.
 - Po kazdej serii obrotow: get_current_board i porownaj z celem (comparison).
-- W odpowiedzi narzedzi pole cells zawiera ten sam JSON co wizja (id, n,e,s,w, shape, brief) — pomocniczo; nadrzedne jest comparison."""
+- Pole "vision" to surowy JSON z modelu wizyjnego (klucz grid: 3x3, komorki z id, n,e,s,w, brief). Do ruchow uzyj comparison, nie rysuj ani nie przepisuj siatki recznie."""
 
 
 AGENT_TOOLS: list[dict[str, Any]] = [
@@ -953,8 +766,7 @@ AGENT_TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "get_target_schema",
             "description": (
-                "Pobiera solved_electricity.png; model wizyjny zwraca cells (3x3: id, n,e,s,w, shape, brief). "
-                "Wywolaj na poczatku."
+                "Pobiera solved_electricity.png; zwraca pole vision — JSON z wizji (grid 3x3). Wywolaj na poczatku."
             ),
             "parameters": {"type": "object", "properties": {}},
         },
@@ -964,7 +776,7 @@ AGENT_TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "get_current_board",
             "description": (
-                "Pobiera swiezy PNG planszy z huba; zapisuje jako img/electric_1.png, img/electric_2.png, ...; zwraca cells (jak wyzej) oraz comparison wzgledem celu."
+                "Pobiera swiezy PNG z huba (img/electric_N.png); zwraca vision (JSON wizji) oraz comparison wzgledem celu z get_target_schema."
             ),
             "parameters": {"type": "object", "properties": {}},
         },
@@ -1028,49 +840,29 @@ def run_agent(
 
     def tool_get_target_schema() -> dict[str, Any]:
         nonlocal cached_target
-        print("[narzedzie] get_target_schema (wizja: tylko odczyt PNG docelowego)")
+        print("[narzedzie] get_target_schema (wizja: PNG docelowy -> JSON)")
         download(SOLVED_PNG_URL, solved_path)
         vp = parse_grid_vision(solved_path)
         target_grid = vp.grid
         cached_target = target_grid
-        log_vision_model_output("CEL — model wizyjny opisuje solved_electricity.png", vp)
-        print("=== CEL — siatka N/E/S/W (wizja) ===")
-        print(format_grid_with_row_labels(target_grid))
-        print("")
         return {
-            "cells": vp.cells,
-            "grid": _grid_as_dicts(target_grid),
-            "ascii": format_grid_ascii(target_grid),
-            "labeled_rows": format_grid_with_row_labels(target_grid),
-            "note": "Pole cells jest kanonicznym wynikiem wizji (to samo co w logu). get_current_board dodaje comparison.",
+            "vision": vp.vision,
+            "note": "vision = JSON z analizy obrazu (grid 3x3). get_current_board doda comparison do celu zapisanym tutaj.",
         }
 
     def tool_get_current_board() -> dict[str, Any]:
-        print("[narzedzie] get_current_board (wizja: tylko odczyt PNG biezacego)")
+        print(f"[narzedzie] get_current_board (wizja: PNG -> JSON, plik zapisany w img/)")
         dest = next_electric_path()
         download(current_url, dest)
         vp = parse_grid_vision(dest)
         g = vp.grid
-        out: dict[str, Any] = {
-            "cells": vp.cells,
-            "grid": _grid_as_dicts(g),
-            "ascii": format_grid_ascii(g),
-            "labeled_rows": format_grid_with_row_labels(g),
-        }
-        log_vision_model_output(f"AKTUALNY stan — model wizyjny opisuje {dest.name}", vp)
+        out: dict[str, Any] = {"vision": vp.vision, "saved_png": dest.name}
         if cached_target is None:
             out["warning"] = "Brak celu w pamieci — najpierw get_target_schema."
-            print("=== AKTUALNY — siatka N/E/S/W (wizja) — brak celu do porownania ===")
-            print(format_grid_with_row_labels(g))
-            print("")
             return out
         cmp = compare_grids_for_agent(g, cached_target)
         out["comparison"] = cmp
         out["match_complete"] = cmp["match_complete"]
-        print_vision_dual_and_summary(
-            g, cached_target, header="Wizja: aktualny vs cel", cmp=cmp
-        )
-        print("")
         return out
 
     def tool_rotate_cell(field: str) -> dict[str, Any]:
@@ -1114,10 +906,10 @@ def run_agent(
         {
             "role": "user",
             "content": (
-                "Rozwiaz puzzle electricity. Kolejnosc: get_target_schema, get_current_board. "
-                "Oba narzedzia zwracaja cells: 3x3 tablica obiektow (id, n,e,s,w, shape, brief) — ten sam format "
-                "co model wizyjny. Do ruchow uzyj comparison.rotations_needed_cw_90. "
-                "Gdy match_complete=true — zero obrotow. Po obrotach znow get_current_board."
+                "Rozwiaz puzzle electricity. Kolejnosc: get_target_schema, potem get_current_board. "
+                "W odpowiedziach jest pole vision (surowy JSON wizji, grid 3x3). "
+                "Do obrotow uzyj wylacznie comparison z get_current_board (rotations_needed_cw_90). "
+                "Gdy match_complete=true — nie obracaj. Po obrotach: get_current_board."
             ),
         },
     ]
@@ -1273,8 +1065,6 @@ def main() -> int:
         print(f"Analiza obrazow modelem wizji: {_active_vision_label()}")
         vp_target = parse_grid_vision(solved_path)
         vp_current = parse_grid_vision(current_path)
-        log_vision_model_output("LEGACY — cel (solved_electricity.png)", vp_target)
-        log_vision_model_output(f"LEGACY — aktualny stan ({current_path.name})", vp_current)
         target = vp_target.grid
         current = vp_current.grid
     else:
